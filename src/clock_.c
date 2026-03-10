@@ -1,5 +1,4 @@
 #include "clock_.h"
-#include "stm32l476xx.h"
 
 /**
   * @brief  System Clock Configuration
@@ -16,8 +15,6 @@
   *            PLLR                           = 2
   *            VCO Frequency(Hz)              = 160000000
   *            Flash Latency(WS)              = 4
-  * @param  None
-  * @retval None
   */
 
 void SystemClock_Config_80MHz(void)

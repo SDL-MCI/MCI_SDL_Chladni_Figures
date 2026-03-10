@@ -1,3 +1,5 @@
+#include "stm32l476xx.h"
+
 #ifndef CLOCK__H
 #define CLOCK__H
 
