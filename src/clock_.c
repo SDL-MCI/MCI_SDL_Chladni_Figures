@@ -141,8 +141,8 @@ void Init_Debug_UART(void)
 
   // ---------- Baud rate ----------
   // oversampling by 16 (default)
-  // BRR = fck / baud = 80 MHz / 115200 = 694.44 -> 694
-  USART2->BRR = (SYSCLK_FREQ / BAUDRATE);
+  // BRR = fck / baud = 80 MHz / 115200 = 8333.34 -> 8333
+  USART2->BRR = (APB1_FREQ / BAUDRATE);
 
   // ---------- Enable TX and RX ----------
   USART2->CR1 |= (1u << 3);   // Transmitter enable

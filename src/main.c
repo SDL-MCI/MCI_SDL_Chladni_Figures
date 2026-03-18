@@ -255,7 +255,7 @@ void serial_setup(void)
 /**
  * @brief Send Teleplot-compatible values periodically.
  */
-void teleplot_output(void)
+void serial_output(void)
 {
   if ((ms_ticks - last_plot_time) >= TELEPLOT_PERIOD_MS)
   {
@@ -266,6 +266,57 @@ void teleplot_output(void)
     // LOG(">Delta:%d\n", (int)encoder_delta);
     // LOG(">CNT:%d\n",   (int)TIM3->CNT);
   }
+}
+
+/**
+ * @brief Configure DAC channel 1 on PA4.
+ *        PA4 is used as analog output (DAC1_OUT1).
+ */
+void dac_setup(void)
+{
+  // ---------- Enable peripheral clocks ----------
+  RCC->AHB2ENR  |= RCC_AHB2ENR_GPIOAEN; // GPIOA clock enable
+  RCC->APB1ENR1 |= RCC_APB1ENR1_DAC1EN; // DAC1 clock enable
+
+  // ---------- PA4 - Analog Mode ----------
+  GPIOA->MODER &= ~(0b11 << (2 * voltage_out));
+  GPIOA->MODER |=  (0b11 << (2 * voltage_out)); // Analog mode
+
+  // ---------- No Pull-Up / Pull-Down ---------- 
+  GPIOA->PUPDR &= ~(0b11 << (2 * voltage_out));
+
+  // ---------- DAC Channel 1 Configuration ----------
+  DAC1->CR &= ~(1u << 2); // TEN1 = 0 ... no trigger, direct write
+  DAC1->CR &= ~(1u << 1); // BOFF1 = 0 ... output buffer enabled
+  DAC1->CR |=  (1u << 0); // EN1 = 1 ... enable DAC channel 1
+}
+
+/**
+ * @brief Write a 12-bit value to DAC channel 1.
+ * @param value DAC value in range 0 ... 4095
+ */
+void dac_write(uint16_t value)
+{
+  value &= 0x0FFF;        // Limit to 12 bit
+  DAC1->DHR12R1 = value;  // 12-bit right-aligned data for channel 1
+}
+
+/*
+  TESTING ONLY:
+*/
+uint16_t frequency_to_dac(float frequency)
+{
+  if (frequency < FREQ_MIN)
+  {
+    frequency = FREQ_MIN;
+  }
+
+  if (frequency > FREQ_MAX)
+  {
+    frequency = FREQ_MAX;
+  }
+
+  return (uint16_t)(((frequency - FREQ_MIN) * 4095.0f) / (FREQ_MAX - FREQ_MIN));
 }
 
 /**
@@ -280,11 +331,15 @@ int main(void)
   button_setup();
   encoder_setup();
   serial_setup();
+  dac_setup();
+
+  dac_write(0);
 
   while (1)
   {
     button();
     encoder_update();
-    teleplot_output();
+    serial_output();
+    // dac_write(frequency_to_dac(frequency_hz));
   }
 }

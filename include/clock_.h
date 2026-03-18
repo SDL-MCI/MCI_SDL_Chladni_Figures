@@ -9,7 +9,7 @@
 #define APB1_FREQ   80000000u
 #define APB2_FREQ   80000000u
 
-#define BAUDRATE    115200u
+#define BAUDRATE    9600u
 
 void SystemClock_Config_80MHz(void);
 void Init_Debug_UART(void);
