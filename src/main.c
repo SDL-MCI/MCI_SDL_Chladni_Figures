@@ -2,6 +2,7 @@
 #include "clock_.h"
 #include <stdio.h>
 #include <stdint.h>
+#include <math.h>
 
 // ---------- Encoder ----------
 const uint8_t ChA_input_pin = 6;  // PC6 = TIM3_CH1 (PIN 4)
@@ -9,25 +10,30 @@ const uint8_t ChB_input_pin = 7;  // PC7 = TIM3_CH2 (PIN 19)
 
 // ---------- Button and LED ----------
 const uint8_t button_pin = 3;     // PB3 (PIN 31)
-const uint8_t led_pin = 5;        // PA5 (PIN 11)
+const uint8_t led_pin    = 5;     // PA5 (PIN 11)
 
 // ---------- Output ----------
 const uint8_t voltage_out = 4;    // PA4 / DAC output (PIN 32)
 
 // ---------- Button / Timebase ----------
 volatile uint8_t button_pressed = 0;  // Set by EXTI interrupt, handled in main loop
-volatile uint8_t led_state = 0;       // Stores current LED state
+volatile uint8_t led_state      = 0;  // Stores current LED state
 
-volatile uint32_t ms_ticks = 0;         // System time base in milliseconds
+volatile uint32_t ms_ticks         = 0; // System time base in milliseconds
 volatile uint32_t last_button_time = 0; // Timestamp of last accepted button press
 
 // ---------- Encoder / Frequency ----------
 volatile int32_t encoder_last_cnt = 0;
-volatile int32_t encoder_delta = 0;
-volatile float frequency_hz = 30.0f;
+volatile int32_t encoder_delta    = 0;
+volatile float frequency_hz       = 30.0f;
 
-// ---------- Serial (Teleplot) ----------
+// ---------- Serial ----------
 volatile uint32_t last_plot_time = 0;
+
+// ---------- DDS ----------
+volatile uint32_t phase_acc       = 0;
+volatile uint32_t tuning_word     = 0;
+volatile uint16_t dac_output_code = 1861u;  // current DAC output (12-bit-code) for serial output
 
 // ---------- Limits ----------
 #define DEBOUNCE_MS         50u
@@ -41,6 +47,18 @@ volatile uint32_t last_plot_time = 0;
 #define ENC_PULSES_PER_REV   24.0f  // Encoder: 24 pulses per 360° rotation (datasheet)
 #define ENC_COUNTS_PER_REV   (ENC_PULSES_PER_REV * 4.0f)  // Encoder-Mode 3 means, we count every flank (x4)
 #define FREQ_STEP_PER_COUNT  (FREQ_PER_REV / ENC_COUNTS_PER_REV)  // 5 Hz per rotation 
+
+// ---------- DDS / DAC Settings ----------
+#define SAMPLE_FREQUENCY  20000u
+#define LUT_SIZE          256u
+#define LUT_SCALE         1000    // signed (very important)
+#define PI_F              3.14159265358979f
+
+#define DAC_MAX_CODE      4095u
+#define DAC_OFFSET_CODE   1861u   // equal to 1.5 V at 3.3 V reference
+#define DAC_AMPL_CODE     1241u   // equal to 1.0 V peak
+
+int16_t sine_lut[LUT_SIZE];
 
 // ---------- Debug Macro ----------
 #define DEBUG
@@ -82,7 +100,7 @@ void EXTI3_IRQHandler(void)
 
 /**
  * @brief Configures button input, LED output and EXTI interrupt.
- *        - PB3: button input with internal pull-up
+ *        - PB3: button input with external pull-up
  *        - PA5: onboard LED output
  *        - EXTI3: interrupt on falling edge for PB3
  */
@@ -94,10 +112,9 @@ void button_setup(void)
   RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;  // Enable SYSCFG clock (needed for EXTI routing)
 
   // ---------- PB3 = button input with pull-up ----------
-  GPIOB->MODER &= ~(0b11 << (2 * button_pin));  // Clear MODER bits -> input mode (00)
+  GPIOB->MODER &= ~(0b11 << (2 * button_pin));  // input mode
 
-  GPIOB->PUPDR &= ~(0b11 << (2 * button_pin));  // Clear pull-up/pull-down bits
-  GPIOB->PUPDR |=  (0b01 << (2 * button_pin));  // Set pull-up (01), needed for active LOW button
+  GPIOB->PUPDR &= ~(0b11 << (2 * button_pin));  // Clear pull-up/pull-down bits (external pull-up)
 
   // ---------- PA5 = LED output ----------
   GPIOA->MODER  &= ~(0b11 << (2 * led_pin));    // Clear MODER bits first
@@ -192,11 +209,11 @@ void encoder_setup(void)
   TIM3->PSC = 0;
 
   // Full 16-bit range (auto-reload register)
-  TIM3->ARR = 0b1111111111111111;
+  TIM3->ARR = 0xFFFF;
 
   // Start in the middle for clean signed delta handling
-  TIM3->CNT = 0b1000000000000000;
-  encoder_last_cnt = 0b1000000000000000;
+  TIM3->CNT = 0x8000;
+  encoder_last_cnt = 0x8000;
 
   // CC1 mapped to TI1, CC2 mapped to TI2
   TIM3->CCMR1 |= (0b01 << 0); // Capture/Compare 1 selection
@@ -215,6 +232,57 @@ void encoder_setup(void)
 
   // Enable counter
   TIM3->CR1 |= TIM_CR1_CEN;
+}
+
+/**
+ * @brief Generate one sine LUT with signed values in range -LUT_SCALE ... +LUT_SCALE.
+ */
+void generate_lut(void)
+{
+  for (uint32_t i = 0; i < LUT_SIZE; i++)
+  {
+    float angle  = (2.0f * PI_F * (float)i) / (float)LUT_SIZE;
+    float s      = sinf(angle);
+    float scaled = s * (float)LUT_SCALE;
+    
+    // Rounding to the nearest integer value
+    if (scaled >= 0.0f)
+    {
+      sine_lut[i] = (int16_t)(scaled + 0.5f);
+    }
+    else
+    {
+      sine_lut[i] = (int16_t)(scaled - 0.5f);
+    }
+  }
+}
+
+/**
+ * @brief Update DDS tuning word from desired output frequency.
+ */
+void update_tuning_word(float freq)
+{
+  if (freq < FREQ_MIN)
+  {
+    freq = FREQ_MIN;
+  }
+
+  if (freq > FREQ_MAX)
+  {
+    freq = FREQ_MAX;
+  }
+
+  double tw = ((double)freq * 4294967296.0) / (double)SAMPLE_FREQUENCY;
+
+  // Rounding to the nearest integer value
+  if (tw >= 0.0)
+  {
+    tuning_word = (uint32_t)(tw + 0.5);
+  }
+  else
+  {
+    tuning_word = (uint32_t)(tw - 0.5);
+  }
 }
 
 /**
@@ -240,12 +308,13 @@ void encoder_update(void)
     {
       frequency_hz = FREQ_MAX;
     }
+
+    update_tuning_word(frequency_hz);
   }
 }
 
 /**
  * @brief Setup serial debug output.
- *        Uses the existing debug UART helper from your lab environment.
  */
 void serial_setup(void)
 {
@@ -262,10 +331,18 @@ void serial_output(void)
     last_plot_time = ms_ticks;
 
     LOG(">Freq:%d\r\n", (int)frequency_hz);
-    // Optional additional traces:
-    // LOG(">Delta:%d\n", (int)encoder_delta);
-    // LOG(">CNT:%d\n",   (int)TIM3->CNT);
+    // LOG(">DAC:%u\r\n", (unsigned int)dac_output_code);
   }
+  /*
+  LOG(">Freq:%d\r\n", (int)frequency_hz);
+  LOG(">DAC:%u\r\n", (unsigned int)dac_output_code);
+  */
+  /*
+  for(int i=0;i<256;i++)
+  {
+    LOG(">LUT:%d\r\n", sine_lut[i]);
+  }
+  */
 }
 
 /**
@@ -289,6 +366,10 @@ void dac_setup(void)
   DAC1->CR &= ~(1u << 2); // TEN1 = 0 ... no trigger, direct write
   DAC1->CR &= ~(1u << 1); // BOFF1 = 0 ... output buffer enabled
   DAC1->CR |=  (1u << 0); // EN1 = 1 ... enable DAC channel 1
+
+  // dac_write(DAC_OFFSET_CODE);
+  dac_output_code = DAC_OFFSET_CODE;
+  DAC1->DHR12R1   = dac_output_code;
 }
 
 /**
@@ -297,26 +378,94 @@ void dac_setup(void)
  */
 void dac_write(uint16_t value)
 {
-  value &= 0x0FFF;        // Limit to 12 bit
-  DAC1->DHR12R1 = value;  // 12-bit right-aligned data for channel 1
+  value &= 0x0FFF;  // Limit to 12 bit
+  dac_output_code = value;
+  DAC1->DHR12R1   = dac_output_code;  // 12-bit right-aligned data for channel 1
 }
 
-/*
-  TESTING ONLY:
-*/
-uint16_t frequency_to_dac(float frequency)
+/**
+ * @brief Configure TIM6 to generate update interrupts at 20 kHz.
+ *        80 MHz / (3999 + 1) = 20 kHz
+ */
+void timer6_setup(void)
 {
-  if (frequency < FREQ_MIN)
-  {
-    frequency = FREQ_MIN;
-  }
+  // ---------- Enable peripheral clock ----------
+  RCC->APB1ENR1 |= RCC_APB1ENR1_TIM6EN;
 
-  if (frequency > FREQ_MAX)
-  {
-    frequency = FREQ_MAX;
-  }
+  // ---------- Reset basic timer configuration ----------
+  TIM6->CR1 = 0;  // clear control register
+  TIM6->PSC = 0;  // prescaler = 0 (timer runs directly at 80 MHz)
 
-  return (uint16_t)(((frequency - FREQ_MIN) * 4095.0f) / (FREQ_MAX - FREQ_MIN));
+  // ---------- Set auto-reload value ----------
+  // 80 MHz / (3999 + 1) = 20 kHz
+  TIM6->ARR = 3999;
+
+  TIM6->EGR  = TIM_EGR_UG;    // Update generation
+  TIM6->SR   = 0;             // Clear pending status flags
+  TIM6->DIER |= TIM_DIER_UIE; // Enable update interrupt
+  TIM6->CR1  |= TIM_CR1_CEN;  // counter enabled (start timer)
+
+  // ---------- Enable TIM6 interrupt in NVIC ----------
+  NVIC_SetPriority(TIM6_DAC_IRQn, 1);
+  NVIC_EnableIRQ(TIM6_DAC_IRQn);
+}
+
+/**
+ * @brief TIM6 interrupt handler.
+ *
+ * This interrupt is executed once per sample period.
+ * It performs one DDS step and writes one new value to the DAC.
+ *
+ * Sequence:
+ * 1. Clear timer update flag
+ * 2. Advance DDS phase accumulator
+ * 3. Use upper 8 bits as LUT index (for 256-entry LUT)
+ * 4. Read normalized sine value from LUT
+ * 5. Scale it with DAC amplitude and add DAC offset
+ * 6. Limit result to valid 12-bit DAC range
+ * 7. Write final value to DAC
+ */
+void TIM6_DAC_IRQHandler(void)
+{
+  // Check if update interrupt flag is set
+  if (TIM6->SR & TIM_SR_UIF)
+  {
+    // Clear update interrupt flag
+    TIM6->SR &= ~TIM_SR_UIF;
+
+    // DDS phase step
+    phase_acc += tuning_word;
+
+    // ---------- Convert phase to LUT index ----------
+    // LUT_SIZE = 256 -> need 8 index bits
+    // Therefore: use the upper 8 bits of the 32-bit phase accumulator
+    uint8_t index   = (uint8_t)(phase_acc >> 24);
+
+    // ---------- Get normalized sine value from LUT ----------
+    int32_t lut_val = sine_lut[index];
+
+    // ---------- Scale LUT value to DAC range ----------
+    //
+    // dac = offset + amplitude * normalized_sine
+    //
+    // with normalized_sine = lut_val / LUT_SCALE
+    int32_t dac_val = (int32_t)DAC_OFFSET_CODE
+                    + ((int32_t)DAC_AMPL_CODE * lut_val) / LUT_SCALE;
+
+    // ---------- Clamp result to valid 12-bit DAC range ----------
+    if (dac_val < 0)
+    {
+      dac_val = 0;
+    }
+
+    if (dac_val > DAC_MAX_CODE)
+    {
+      dac_val = DAC_MAX_CODE;
+    }
+
+    // ---------- Write sample to DAC and update debug variable ----------
+    dac_write((uint16_t)dac_val);
+  }
 }
 
 /**
@@ -325,7 +474,6 @@ uint16_t frequency_to_dac(float frequency)
 int main(void)
 {
   SystemClock_Config_80MHz();
-
   SysTick_Config(80000000u / 1000u);
 
   button_setup();
@@ -333,13 +481,14 @@ int main(void)
   serial_setup();
   dac_setup();
 
-  dac_write(0);
+  generate_lut();
+  update_tuning_word(frequency_hz);
+  timer6_setup();
 
   while (1)
   {
-    button();
-    encoder_update();
+    button();         // only LED toggle for now
+    encoder_update(); // update sine frequency
     serial_output();
-    // dac_write(frequency_to_dac(frequency_hz));
   }
 }
