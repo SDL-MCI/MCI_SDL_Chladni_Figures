@@ -1,22 +1,32 @@
+/**
+ * @file    clock_.c
+ * @brief   Contains system clock configuration, UART initialization,
+ *          delay function and printf redirection.
+ *
+ * This source file is used to set up the STM32L476RG basic infrastructure.
+ * It configures the µC to run at 80 MHz, initializes USART2
+ * for serial communication, provides a simple blocking delay, and redirects
+ * printf() output to the UART interface.
+ */
+
 #include "clock_.h"
 #include <stdio.h>
 
 /**
-  * @brief  System Clock Configuration
-  *         The system Clock is configured as follow :
-  *            System Clock source            = PLL (HSI16)
-  *            SYSCLK(Hz)                     = 80000000
-  *            HCLK(Hz)                       = 80000000
-  *            AHB Prescaler                  = 1
-  *            APB1 Prescaler                 = 1
-  *            APB2 Prescaler                 = 1
-  *            PLL Source                     = HSI16 (16 MHz)
-  *            PLLM                           = 1
-  *            PLLN                           = 10
-  *            PLLR                           = 2
-  *            VCO Frequency(Hz)              = 160000000
-  *            Flash Latency(WS)              = 4
-  */
+ * @brief  Configures the STM32L476 system clock to 80 MHz.
+ *
+ * The clock tree is configured as follows:
+ * - Clock source: HSI16
+ * - PLL input: 16 MHz / 1
+ * - PLL multiplication: x10
+ * - PLL output division: /2
+ * - SYSCLK = 80 MHz
+ * - AHB  = 80 MHz
+ * - APB1 = 80 MHz
+ * - APB2 = 80 MHz
+ *
+ * Flash latency and voltage scaling are configured accordingly.
+ */
 void SystemClock_Config_80MHz(void)
 {
   // 1.) PWR (Power control) clock enable (APB1ENR1, Bit 28 = HIGH)
@@ -94,9 +104,14 @@ void SystemClock_Config_80MHz(void)
 }
 
 /**
- * @brief  Initializes USART2 for debug output / Teleplot.
- *         USART2_TX = PA2, USART2_RX = PA3
- *         On STM32L476, PA2/PA3 use AF7 for USART2.
+ * @brief  Initializes USART2 for serial debug communication.
+ *
+ * USART2 is configured for basic asynchronous communication and can be used
+ * for terminal output, debugging messages, and Teleplot visualization.
+ *
+ * Pin assignment:
+ * - PA2 -> USART2_TX
+ * - PA3 -> USART2_RX
  */
 void Init_Debug_UART(void)
 {
@@ -153,8 +168,12 @@ void Init_Debug_UART(void)
 }
 
 /**
- * @brief Simple blocking delay.
- *        Crude software delay only.
+ * @brief  Generates a simple blocking software delay.
+ * @param  time Number of loop iterations.
+ *
+ * This function creates a crude delay by executing NOP instructions in a loop.
+ * It is not timing-accurate and depends on compiler optimization and system clock.
+ * It should only be used for simple waiting periods where precise timing is not required.
  */
 void delay(uint32_t time)
 {
@@ -162,11 +181,17 @@ void delay(uint32_t time)
   {
     asm("nop"); // No operation, used for delaying
   }
-  return 0;
 }
 
 /**
- * @brief Redirect printf() to USART2.
+ * @brief  Redirects standard output to USART2.
+ * @param  handle File handle (unused).
+ * @param  data   Pointer to the data buffer.
+ * @param  size   Number of bytes to transmit.
+ * @retval Number of transmitted bytes.
+ *
+ * This function enables the use of printf() over USART2 by sending each
+ * character through the UART transmit register.
  */
 int _write(int handle, char *data, int size)
 {
