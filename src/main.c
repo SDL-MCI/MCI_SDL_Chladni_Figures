@@ -65,7 +65,7 @@ const uint8_t DAC_OUT_PIN = 4;  // PA4 / DAC output (PIN 32)
 // ============================================================================
 
 #define FREQ_MIN 30.0f
-#define FREQ_MAX 1000.0f
+#define FREQ_MAX 400.0f
 
 // ============================================================================
 // Ramp Settings
@@ -96,11 +96,11 @@ const uint8_t DAC_OUT_PIN = 4;  // PA4 / DAC output (PIN 32)
 
 #define DAC_MAX_CODE      4095u
 #define DAC_OFFSET_CODE   1861u   // ~1.5 V at 3.3 V reference
-#define DAC_AMPL_CODE     1241u   // ~1.0 V peak
+#define DAC_AMPL_CODE     1241u   // ~1.0 V peak (100% amplitude)
 
 // Linear amplitude ramp:
-// rough start value derived from approx. 0.8 Vrms at low frequency
-#define DAC_AMPL_MIN_CODE 216u
+// low frequency amplitude at 30 Hz
+#define DAC_AMPL_MIN_CODE 311u    // Adjust the lower limit for amplitude tuning
 
 // ============================================================================
 // OLED / I2C Settings
@@ -169,6 +169,7 @@ volatile uint32_t last_oled_update_time = 0u;
 
 // ---------- Utility ----------
 uint32_t get_amplitude_percent_value(void);
+uint32_t get_frequency_display_value(void);
 uint16_t amplitude_code_from_frequency(float freq);
 
 // ---------- Button / LED ----------
@@ -230,9 +231,28 @@ uint32_t get_amplitude_percent_value(void)
 }
 
 /**
+ * @brief Returns the selected frequency rounded to the nearest integer Hz.
+ * @return Frequency in whole Hz within the valid range
+ */
+uint32_t get_frequency_display_value(void)
+{
+  if (frequency_hz <= FREQ_MIN)
+  {
+    return (uint32_t)FREQ_MIN;
+  }
+
+  if (frequency_hz >= FREQ_MAX)
+  {
+    return (uint32_t)FREQ_MAX;
+  }
+
+  return (uint32_t)(frequency_hz + 0.5f);
+}
+
+/**
  * @brief Returns a frequency-dependent DAC amplitude code.
- *        First simple approach: linear ramp from low amplitude at 30 Hz
- *        to maximum amplitude at 1000 Hz.
+ *        Linear ramp from low amplitude at 30 Hz
+ *        to maximum amplitude at 400 Hz.
  *
  * @param freq Frequency in Hz
  * @return DAC amplitude code
@@ -441,12 +461,12 @@ void encoder_setup(void)
 
 /**
  * @brief Reads encoder movement and updates the selected output frequency.
- *        The selectable frequency is limited to integer values in the range
- *        30 ... 1000 Hz.
+ *        The internal frequency is kept as a float for smooth encoder behavior.
+ *        Only the applied output frequency is rounded to integer Hz.
  *
- *        When the output is enabled, the new frequency and amplitude are
- *        applied immediately. When the output is disabled, only the selected
- *        frequency value is updated.
+ *        When the output is enabled, the rounded frequency and corresponding
+ *        amplitude are applied immediately. When the output is disabled,
+ *        only the selected frequency value is updated internally.
  */
 void encoder_update(void)
 {
@@ -455,12 +475,12 @@ void encoder_update(void)
 
   if (encoder_delta != 0)
   {
+    float freq_apply;
+
     encoder_last_cnt = cnt_now;
 
+    // Keep internal frequency continuous
     frequency_hz += ((float)encoder_delta * FREQ_STEP_PER_COUNT);
-
-    // Allow only integer output frequencies
-    frequency_hz = roundf(frequency_hz);
 
     if (frequency_hz < FREQ_MIN)
     {
@@ -475,8 +495,10 @@ void encoder_update(void)
     // Apply directly only while output is active
     if (output_enabled)
     {
-      update_tuning_word(frequency_hz);
-      dac_ampl_target_code  = amplitude_code_from_frequency(frequency_hz);
+      freq_apply = (float)get_frequency_display_value();
+
+      update_tuning_word(freq_apply);
+      dac_ampl_target_code  = amplitude_code_from_frequency(freq_apply);
       dac_ampl_current_code = dac_ampl_target_code;
     }
   }
@@ -504,7 +526,7 @@ void serial_output(void)
   {
     last_plot_time = ms_ticks;
 
-    uint32_t freq_int = (uint32_t)frequency_hz;
+    uint32_t freq_int = get_frequency_display_value();
     uint32_t ampl_pct = get_amplitude_percent_value();
 
     LOG(">Freq:%lu\r\n", (unsigned long)freq_int);
@@ -538,10 +560,9 @@ void dac_setup(void)
   DAC1->CR &= ~(1u << 1); // BOFF1 = 0 ... output buffer enabled
   DAC1->CR |=  (1u << 0); // EN1 = 1 ... enable DAC channel 1
 
-  dac_ampl_current_code = amplitude_code_from_frequency(frequency_hz);
+  dac_ampl_current_code = amplitude_code_from_frequency((float)get_frequency_display_value());
   dac_ampl_target_code  = dac_ampl_current_code;
 
-  // dac_write(DAC_OFFSET_CODE);
   dac_output_code = DAC_OFFSET_CODE;
   DAC1->DHR12R1   = dac_output_code;
 }
@@ -722,7 +743,7 @@ void shutdown(void)
 
   // ---------- Final OFF state ----------
   dac_ampl_current_code = 0u;
-  dac_ampl_target_code  = amplitude_code_from_frequency(frequency_hz);
+  dac_ampl_target_code  = amplitude_code_from_frequency((float)get_frequency_display_value());
 
   output_enabled = 0u;
 
@@ -740,11 +761,11 @@ void start_up(void)
 {
   // ---------- Start directly at 30 Hz ----------
   frequency_hz = FREQ_MIN;
-  update_tuning_word(frequency_hz);
+  update_tuning_word((float)get_frequency_display_value());
 
   // ---------- Start from zero amplitude ----------
   dac_ampl_current_code = 0u;
-  dac_ampl_target_code  = amplitude_code_from_frequency(frequency_hz);
+  dac_ampl_target_code  = amplitude_code_from_frequency((float)get_frequency_display_value());
 
   phase_acc = 0u;
   output_enabled = 1u;
@@ -1129,7 +1150,7 @@ void oled_show_frequency_or_off(void)
   }
   else
   {
-    freq_int = (int32_t)(frequency_hz);
+    freq_int = get_frequency_display_value();
     ampl_pct = get_amplitude_percent_value();
 
     snprintf(line1, sizeof(line1), "FREQ:%luHz", (unsigned long)freq_int);
