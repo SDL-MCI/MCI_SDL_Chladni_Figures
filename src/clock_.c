@@ -156,7 +156,8 @@ void Init_Debug_UART(void)
 
   // ---------- Baud rate ----------
   // oversampling by 16 (default)
-  // BRR = fck / baud = 80 MHz / 115200 = 8333.34 -> 8333
+  // BRR = fck / baud
+  // Example: 80 MHz / 9600 = 8333.33 -> 8333
   USART2->BRR = (APB1_FREQ / BAUDRATE);
 
   // ---------- Enable TX and RX ----------
@@ -195,6 +196,8 @@ void delay(uint32_t time)
  */
 int _write(int handle, char *data, int size)
 {
+  (void)handle;
+
   int count = size;
   while (count--)
   {

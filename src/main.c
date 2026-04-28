@@ -6,18 +6,27 @@
  * This program runs on the STM32L476RG and generates a sine signal at the DAC output
  * (PA4). The output frequency can be adjusted with a rotary encoder using TIM3 in
  * encoder mode. A push button on PB3 toggles the signal output with controlled
- * startup and shutdown ramps. The currently selected frequency is shown on an SSD1306
- * OLED display via I2C1 and is also sent periodically over UART in Teleplot-compatible
- * format.
+ * startup and shutdown ramps. The currently selected frequency and amplitude are
+ * shown on an SSD1306 OLED display via I2C1 and are also sent periodically over
+ * UART in Teleplot-compatible format.
  *
  * Functional overview:
  * - Rotary encoder on PC6 / PC7 for frequency adjustment
  * - Push button on PB3 for controlled output enable / disable
  * - DAC output on PA4
  * - DDS-based sine generation using LUT and TIM6 interrupt
- * - Linear frequency-dependent amplitude ramp
+ * - Frequency-dependent amplitude selection using an empirical lookup table
  * - UART debug / Teleplot output
  * - SSD1306 OLED display via I2C1 for frequency / amplitude / OFF status
+ *
+ * Implementation notes:
+ * - The amplitude table uses a conservative set of 7 well-distributed support points
+ *   to provide stable behavior over the selected frequency range.
+ * - I2C communication uses timeout handling to prevent long blocking periods.
+ * - OLED updates are performed periodically with a moderate refresh rate to reduce
+ *   I2C bus activity during signal generation.
+ * - The button must be held for 2 seconds before shutdown / startup is executed.
+ * - Wider amplitude lookup windows are used to reduce interpolation sensitivity.
  *
  * Note:
  * The implementation of the I2C / OLED handling and parts of the DDS / LUT-based
@@ -56,9 +65,10 @@ const uint8_t DAC_OUT_PIN = 4;  // PA4 / DAC output (PIN 32)
 // Timing / UI Settings
 // ============================================================================
 
-#define DEBOUNCE_MS             50u
+#define DEBOUNCE_MS             300u
+#define BUTTON_HOLD_MS          2000u
 #define USART_PERIOD_MS         50u
-#define OLED_UPDATE_PERIOD_MS   500u // Keep this value moderate; overly frequent OLED updates may introduce output disturbances
+#define OLED_UPDATE_PERIOD_MS   1000u  // Moderate refresh rate to reduce I2C bus activity
 
 // ============================================================================
 // Frequency Limits
@@ -72,7 +82,7 @@ const uint8_t DAC_OUT_PIN = 4;  // PA4 / DAC output (PIN 32)
 // ============================================================================
 
 #define RAMP_STEPS         50u
-#define RAMP_DELAY_TICKS   10e5  // tuneable (~2s shutdown)
+#define RAMP_DELAY_TICKS   10e5  // Tunable (~2s shutdown)
 
 // ============================================================================
 // Encoder Settings
@@ -80,7 +90,7 @@ const uint8_t DAC_OUT_PIN = 4;  // PA4 / DAC output (PIN 32)
 
 #define FREQ_PER_REV         10.0f  // Chosen user sensitivity 
 #define ENC_PULSES_PER_REV   24.0f  // Encoder: 24 pulses per 360° rotation (datasheet)
-#define ENC_COUNTS_PER_REV   (ENC_PULSES_PER_REV * 4.0f)  // Encoder-Mode 3 means, we count every flank (x4)
+#define ENC_COUNTS_PER_REV   (ENC_PULSES_PER_REV * 4.0f)  // Encoder-Mode 3 means we count every flank (x4)
 #define FREQ_STEP_PER_COUNT  (FREQ_PER_REV / ENC_COUNTS_PER_REV)  // 10 Hz per rotation 
 
 // ============================================================================
@@ -98,9 +108,42 @@ const uint8_t DAC_OUT_PIN = 4;  // PA4 / DAC output (PIN 32)
 #define DAC_OFFSET_CODE   1861u   // ~1.5 V at 3.3 V reference
 #define DAC_AMPL_CODE     1241u   // ~1.0 V peak (100% amplitude)
 
-// Linear amplitude ramp:
-// low frequency amplitude at 30 Hz
-#define DAC_AMPL_MIN_CODE 311u    // Adjust the lower limit for amplitude tuning
+// ============================================================================
+// Frequency-dependent Amplitude Settings
+// ============================================================================
+//
+// The table contains relative STM DAC amplitudes.
+// 1.0 corresponds to DAC_AMPL_CODE, i.e. approximately 1 V peak at the STM DAC.
+// 0.5 corresponds to approximately 0.5 V peak, etc.
+//
+// The amplitude table is intentionally conservative:
+// - 7 well-distributed support points
+// - Smooth characteristic without sharp amplitude jumps
+// - Stable behavior over the full frequency range
+//
+// The values were derived from measured amplifier LEVEL settings.
+// The external amplifier LEVEL can later be set to a fixed suitable value.
+
+#define AMP_WINDOW_WIDE 5.0f  // Wide tolerance (prevents interpolation precision issues)
+#define MIN_DAC_AMPL_CODE 50u // Minimum amplitude guard
+
+typedef struct
+{
+  float freq_hz;
+  float ampl_rel;
+} AmpPoint;
+
+// Frequency-dependent amplitude table: 7 smooth support points
+static const AmpPoint amp_table[] =
+{
+  { 30.0f,  0.20f },   // Anchor (minimum)
+  { 100.0f, 0.40f },   // Average of 56, 60 Hz region
+  { 150.0f, 0.40f },   // Average of 130, 142, 164 Hz region
+  { 200.0f, 0.50f },   // Average of 172, 214, 223 Hz region
+  { 250.0f, 0.60f },   // Average of 247 Hz region
+  { 350.0f, 0.40f },   // 348 Hz
+  { 400.0f, 0.25f }    // Anchor (tail)
+};
 
 // ============================================================================
 // OLED / I2C Settings
@@ -115,6 +158,13 @@ const uint8_t DAC_OUT_PIN = 4;  // PA4 / DAC output (PIN 32)
 
 #define OLED_I2C_ADDR            0x3Cu
 #define I2C1_TIMING_100KHZ_80MHZ 0x10909CECu  // Practical timing value for I2C1 @ 80 MHz -> Standard Mode (~100 kHz)
+
+// ============================================================================
+// I2C Timeout Settings
+// ============================================================================
+
+// Timeout limits long I2C stalls and keeps the TIM6 DAC interrupt responsive
+#define I2C_TIMEOUT_COUNT 5000u  // Timeout loop count
 
 // ============================================================================
 // Debug Macro
@@ -132,11 +182,13 @@ const uint8_t DAC_OUT_PIN = 4;  // PA4 / DAC output (PIN 32)
 // ============================================================================
 
 // ---------- Button / LED / Timebase ----------
-volatile uint8_t button_pressed    = 0u;  // Set by EXTI interrupt, handled in main loop
-volatile uint8_t led_state         = 0u;  // Stores current LED state
+volatile uint8_t button_hold_active = 0u;  // Active while the button hold check is running
+volatile uint8_t button_action_done = 0u;  // Prevents repeated action during one button hold
+volatile uint8_t led_state          = 0u;  // Stores current LED state for debugging / future use
 
-volatile uint32_t ms_ticks         = 0u; // System time base in milliseconds
-volatile uint32_t last_button_time = 0u; // Timestamp of last accepted button press
+volatile uint32_t ms_ticks                 = 0u; // System time base in milliseconds
+volatile uint32_t last_button_time         = 0u; // Timestamp of last accepted button action
+volatile uint32_t button_hold_start_time   = 0u; // Timestamp when button hold started
 
 // ---------- Encoder / Frequency ----------
 volatile int32_t encoder_last_cnt = 0;
@@ -144,7 +196,7 @@ volatile int32_t encoder_delta    = 0;
 volatile float   frequency_hz     = FREQ_MIN;
 
 // ---------- Output State ----------
-volatile uint8_t output_enabled = 1u;    // used for ON/OFF function (DAC)
+volatile uint8_t output_enabled = 1u;    // Used for ON/OFF function (DAC)
 
 // ---------- Serial ----------
 volatile uint32_t last_plot_time = 0u;
@@ -152,7 +204,7 @@ volatile uint32_t last_plot_time = 0u;
 // ---------- DDS / DAC ----------
 volatile uint32_t phase_acc       = 0u;
 volatile uint32_t tuning_word     = 0u;
-volatile uint16_t dac_output_code = 1861u;  // current DAC output (12-bit-code) for serial output
+volatile uint16_t dac_output_code = DAC_OFFSET_CODE;  // Current DAC output (12-bit-code) for serial output
 
 volatile uint16_t dac_ampl_current_code = DAC_AMPL_CODE;
 volatile uint16_t dac_ampl_target_code  = DAC_AMPL_CODE;
@@ -162,6 +214,7 @@ int16_t sine_lut[LUT_SIZE];
 // ---------- OLED ----------
 uint8_t oled_buffer[OLED_BUFFER_SIZE];
 volatile uint32_t last_oled_update_time = 0u;
+volatile uint8_t oled_update_pending = 0u;  // Reserved flag for possible OLED update scheduling
 
 // ============================================================================
 // Function Prototypes
@@ -213,6 +266,41 @@ void oled_show_frequency_or_off(void);
 void oled_task(void);
 
 // ============================================================================
+// Main
+// ============================================================================
+
+/**
+ * @brief Main entry point.
+ */
+int main(void)
+{
+  SystemClock_Config_80MHz();
+  SysTick_Config(SYSCLK_FREQ / 1000u);
+
+  button_setup();
+  encoder_setup();
+  serial_setup();
+  dac_setup();
+
+  i2c1_setup();
+  oled_init();
+
+  generate_lut();
+  update_tuning_word(frequency_hz);
+  timer6_setup();
+
+  oled_show_frequency_or_off();
+
+  while (1)
+  {
+    button();
+    encoder_update();
+    serial_output();
+    oled_task();
+  }
+}
+
+// ============================================================================
 // Utility
 // ============================================================================
 
@@ -250,38 +338,115 @@ uint32_t get_frequency_display_value(void)
 }
 
 /**
- * @brief Returns a frequency-dependent DAC amplitude code.
- *        Linear ramp from low amplitude at 30 Hz
- *        to maximum amplitude at 400 Hz.
+ * @brief Returns the DAC amplitude code from the selected frequency.
+ *
+ *        The amplitude is calculated from an empirical frequency table.
+ *        Wide lookup windows around the support points reduce unnecessary
+ *        interpolation and improve stable behavior.
+ *
+ *        Implementation details:
+ *        - Wide tolerance windows around support points
+ *        - Conservative table with smooth amplitude transitions
+ *        - Double-precision intermediate calculations
+ *        - Explicit bounds checking
+ *        - Minimum amplitude guard to prevent signal collapse
  *
  * @param freq Frequency in Hz
- * @return DAC amplitude code
+ * @return DAC amplitude code (never 0 unless explicitly disabled)
  */
 uint16_t amplitude_code_from_frequency(float freq)
 {
-  const float f_min = FREQ_MIN;
-  const float f_max = FREQ_MAX;
+  const uint32_t n = sizeof(amp_table) / sizeof(amp_table[0]);
 
-  const float ampl_min = (float)DAC_AMPL_MIN_CODE;
-  const float ampl_max = (float)DAC_AMPL_CODE;
-
-  float k;
-  float ampl;
-
-  if (freq <= f_min)
+  // ---------- Input validation ----------
+  if (freq < FREQ_MIN)
   {
-    return (uint16_t)(ampl_min + 0.5f);
+    freq = FREQ_MIN;
+  }
+  if (freq > FREQ_MAX)
+  {
+    freq = FREQ_MAX;
   }
 
-  if (freq >= f_max)
+  float ampl_target = amp_table[0].ampl_rel;  // Default to first point
+
+  // ---------- Check constant windows first ----------
+  for (uint32_t i = 0; i < n; i++)
   {
-    return (uint16_t)(ampl_max + 0.5f);
+    float f_center = amp_table[i].freq_hz;
+    float f_min = f_center - AMP_WINDOW_WIDE;
+    float f_max = f_center + AMP_WINDOW_WIDE;
+
+    if ((freq >= f_min) && (freq <= f_max))
+    {
+      // We're within a constant-amplitude window -> use this value directly
+      ampl_target = amp_table[i].ampl_rel;
+      goto amplitude_clamp;  // Jump to clamping section
+    }
   }
 
-  k = (freq - f_min) / (f_max - f_min);
-  ampl = ampl_min + k * (ampl_max - ampl_min);
+  // ---------- Interpolate between nearest points if outside all windows ----------
+  // Only do this if absolutely necessary (i.e., freq not in any window)
+  
+  // Find the two bracketing points
+  for (uint32_t i = 0; i < (n - 1u); i++)
+  {
+    float f0 = amp_table[i].freq_hz;
+    float f1 = amp_table[i + 1u].freq_hz;
 
-  return (uint16_t)(ampl + 0.5f);
+    // Check if freq is between the two points (outside their windows)
+    float f0_max = f0 + AMP_WINDOW_WIDE;
+    float f1_min = f1 - AMP_WINDOW_WIDE;
+
+    if ((freq > f0_max) && (freq < f1_min))
+    {
+      // Linear interpolation between f0 and f1
+      float a0 = amp_table[i].ampl_rel;
+      float a1 = amp_table[i + 1u].ampl_rel;
+
+      // Use double precision for intermediate calculation to reduce rounding error
+      double freq_d = (double)freq;
+      double f0_d = (double)f0;
+      double f1_d = (double)f1;
+      double a0_d = (double)a0;
+      double a1_d = (double)a1;
+
+      double k_d = (freq_d - f0_d) / (f1_d - f0_d);
+      double ampl_d = a0_d + k_d * (a1_d - a0_d);
+
+      ampl_target = (float)ampl_d;
+      goto amplitude_clamp;
+    }
+  }
+
+  // ---------- Fallback: If freq is above all points, use last ----------
+  ampl_target = amp_table[n - 1u].ampl_rel;
+
+amplitude_clamp:
+  // ---------- Clamp relative amplitude ----------
+  if (ampl_target < 0.0f)
+  {
+    ampl_target = 0.0f;
+  }
+  if (ampl_target > 1.0f)
+  {
+    ampl_target = 1.0f;
+  }
+
+  // ---------- Convert relative amplitude to DAC code ----------
+  uint16_t code = (uint16_t)((float)DAC_AMPL_CODE * ampl_target + 0.5f);
+  
+  
+  // ---------- Enforce minimum amplitude to prevent collapse ----------
+  // Even at very low amplitude, maintain at least 50 DAC codes.
+  // This prevents the signal from disappearing due to rounding/precision loss.
+
+  if (code < MIN_DAC_AMPL_CODE)
+  {
+    code = MIN_DAC_AMPL_CODE;
+  }
+
+  return code;
 }
 
 // ============================================================================
@@ -300,7 +465,10 @@ void SysTick_Handler(void)
 /**
  * @brief External interrupt handler for EXTI line 3.
  *        Triggered on a falling edge at PB3 (active LOW button).
- *        Applies a simple software debounce using the SysTick time base.
+ *
+ *        The interrupt only starts the hold detection.
+ *        The actual shutdown / startup action is executed in the main loop
+ *        only if the button remains pressed for BUTTON_HOLD_MS.
  */
 void EXTI3_IRQHandler(void)
 {
@@ -308,11 +476,19 @@ void EXTI3_IRQHandler(void)
   {
     EXTI->PR1 = (1u << 3);    // Clear EXTI3 pending flag by writing 1
 
-    // Accept button press only if debounce time has elapsed
-    if ((ms_ticks - last_button_time) >= DEBOUNCE_MS)
+    // Start hold detection only if no hold is currently active
+    // and debounce time has elapsed since the last accepted action.
+    if ((button_hold_active == 0u) &&
+        ((ms_ticks - last_button_time) >= DEBOUNCE_MS))
     {
-      button_pressed = 1u;
-      last_button_time = ms_ticks;
+      // Button is active LOW.
+      // Only start hold detection if PB3 is currently LOW.
+      if ((GPIOB->IDR & (1u << BUTTON_PIN)) == 0u)
+      {
+        button_hold_active = 1u;
+        button_action_done = 0u;
+        button_hold_start_time = ms_ticks;
+      }
     }
   }
 }
@@ -335,8 +511,10 @@ void button_setup(void)
   RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;  // Enable SYSCFG clock (needed for EXTI routing)
 
   // ---------- PB3 = button input with external pull-up ----------
-  GPIOB->MODER &= ~(0b11 << (2 * BUTTON_PIN));  // input mode
+  GPIOB->MODER &= ~(0b11 << (2 * BUTTON_PIN));  // Input mode
+
   GPIOB->PUPDR &= ~(0b11 << (2 * BUTTON_PIN));  // Clear pull-up/pull-down bits (external pull-up)
+  GPIOB->PUPDR |=  (0b01 << (2 * BUTTON_PIN));  // Internal pull-up enabled
 
   // ---------- PA5 = LED output ----------
   GPIOA->MODER  &= ~(0b11 << (2 * LED_PIN));    // Clear MODER bits first
@@ -362,14 +540,39 @@ void button_setup(void)
 }
 
 /**
- * @brief Processes button events in the main loop.
- *        Button performs controlled amplitude shutdown / startup.
+ * @brief Processes button hold events in the main loop.
+ *
+ *        The button must be held LOW continuously for BUTTON_HOLD_MS
+ *        before shutdown / startup is executed.
+ *
+ *        If the button is released before the hold time is reached,
+ *        the event is cancelled. This rejects short EMI spikes.
  */
 void button(void)
 {
-  if (button_pressed)
+  // No active hold detection running
+  if (button_hold_active == 0u)
   {
-    button_pressed = 0u;
+    return;
+  }
+
+  // Button is active LOW.
+  // If PB3 is HIGH again, the button was released before the hold time.
+  if ((GPIOB->IDR & (1u << BUTTON_PIN)) != 0u)
+  {
+    button_hold_active = 0u;
+    button_action_done = 0u;
+    return;
+  }
+
+  // Button is still pressed.
+  // Execute action only once after BUTTON_HOLD_MS.
+  if ((button_action_done == 0u) &&
+      ((ms_ticks - button_hold_start_time) >= BUTTON_HOLD_MS))
+  {
+    button_action_done = 1u;
+    button_hold_active = 0u;
+    last_button_time = ms_ticks;
 
     if (output_enabled)
     {
@@ -434,7 +637,7 @@ void encoder_setup(void)
   TIM3->PSC = 0;
 
   // Full 16-bit range (auto-reload register)
-  TIM3->ARR = 0xFFFF;
+  TIM3->ARR = MAX_RELOAD;
 
   // Start in the middle for clean signed delta handling
   TIM3->CNT = 0x8000;
@@ -641,8 +844,8 @@ void timer6_setup(void)
   RCC->APB1ENR1 |= RCC_APB1ENR1_TIM6EN;
 
   // ---------- Reset basic timer configuration ----------
-  TIM6->CR1 = 0;  // clear control register
-  TIM6->PSC = 0;  // prescaler = 0 (timer runs directly at 80 MHz)
+  TIM6->CR1 = 0;  // Clear control register
+  TIM6->PSC = 0;  // Prescaler = 0 (timer runs directly at 80 MHz)
 
   // ---------- Set auto-reload value ----------
   // 80 MHz / (3999 + 1) = 20 kHz
@@ -651,7 +854,7 @@ void timer6_setup(void)
   TIM6->EGR  = TIM_EGR_UG;    // Update generation
   TIM6->SR   = 0;             // Clear pending status flags
   TIM6->DIER |= TIM_DIER_UIE; // Enable update interrupt
-  TIM6->CR1  |= TIM_CR1_CEN;  // counter enabled (start timer)
+  TIM6->CR1  |= TIM_CR1_CEN;  // Counter enabled (start timer)
 
   // ---------- Enable TIM6 interrupt in NVIC ----------
   NVIC_SetPriority(TIM6_DAC_IRQn, 1);
@@ -850,7 +1053,12 @@ void i2c1_setup(void)
 
 /**
  * @brief Write byte block to 7-bit I2C slave.
- * @return 1 on success, 0 on error
+ *
+ *        The timeout limits I2C blocking time so that the TIM6 DAC interrupt
+ *        remains responsive. If I2C communication fails, the function returns
+ *        with an error code and the main loop can continue running.
+ *
+ * @return 1 on success, 0 on error (I2C bus busy or timeout)
  */
 uint8_t i2c1_write(uint8_t addr7, const uint8_t *data, uint16_t len)
 {
@@ -861,9 +1069,12 @@ uint8_t i2c1_write(uint8_t addr7, const uint8_t *data, uint16_t len)
     return 0u;
   }
 
-  timeout = 100000u;
+  // Limit waiting time to prevent long I2C stalls
+  timeout = I2C_TIMEOUT_COUNT;
   while ((I2C1->ISR & I2C_ISR_BUSY) && timeout--)
   {
+    // Small delay per iteration to simulate timing
+    for (volatile int delay_cnt = 0; delay_cnt < 10; delay_cnt++);
   }
   if (timeout == 0u)
   {
@@ -880,7 +1091,7 @@ uint8_t i2c1_write(uint8_t addr7, const uint8_t *data, uint16_t len)
 
   for (uint16_t i = 0; i < len; i++)
   {
-    timeout = 100000u;
+    timeout = I2C_TIMEOUT_COUNT;
 
     while (!(I2C1->ISR & I2C_ISR_TXIS))
     {
@@ -894,18 +1105,24 @@ uint8_t i2c1_write(uint8_t addr7, const uint8_t *data, uint16_t len)
       {
         return 0u;
       }
+      
+      // Small delay per iteration
+      for (volatile int delay_cnt = 0; delay_cnt < 10; delay_cnt++);
     }
 
     I2C1->TXDR = data[i];
   }
 
-  timeout = 100000u;
+  timeout = I2C_TIMEOUT_COUNT;
   while (!(I2C1->ISR & I2C_ISR_STOPF))
   {
     if (timeout-- == 0u)
     {
       return 0u;
     }
+    
+    // Small delay per iteration
+    for (volatile int delay_cnt = 0; delay_cnt < 10; delay_cnt++);
   }
 
   I2C1->ICR = I2C_ICR_STOPCF;
@@ -1080,7 +1297,7 @@ static const uint8_t *font_find(char c)
     }
   }
 
-  return font5x7[0].data; // fallback = space
+  return font5x7[0].data; // Fallback = space
 }
 
 /**
@@ -1171,6 +1388,9 @@ void oled_show_frequency_or_off(void)
 
 /**
  * @brief Refresh OLED periodically.
+ *
+ *        The OLED is updated periodically with a moderate refresh rate.
+ *        This reduces I2C bus activity and keeps the DAC interrupt responsive.
  */
 void oled_task(void)
 {
@@ -1178,40 +1398,5 @@ void oled_task(void)
   {
     last_oled_update_time = ms_ticks;
     oled_show_frequency_or_off();
-  }
-}
-
-// ============================================================================
-// Main
-// ============================================================================
-
-/**
- * @brief Main entry point.
- */
-int main(void)
-{
-  SystemClock_Config_80MHz();
-  SysTick_Config(80000000u / 1000u);
-
-  button_setup();
-  encoder_setup();
-  serial_setup();
-  dac_setup();
-
-  i2c1_setup();
-  oled_init();
-
-  generate_lut();
-  update_tuning_word(frequency_hz);
-  timer6_setup();
-
-  oled_show_frequency_or_off();
-
-  while (1)
-  {
-    button();
-    encoder_update();
-    serial_output();
-    oled_task();
   }
 }
